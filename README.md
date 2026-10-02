@@ -1,47 +1,144 @@
-# Open WebUI Chat Repair
+<!-- markdownlint-disable MD033 -->
 
-**Rescue Tool for Open WebUI chats that get stuck on the "Loading..." spinner.**
+# Open WebUI Tools
 
-![App Screenshot](./assets/screenshot.png)
+A collection of tools, filters and fixes for
+[Open WebUI](https://github.com/open-webui/open-webui). Each project
+lives in its own folder and can be used on its own.
 
-🔗 [**Launch the Repair Tool**](https://fractuscontext.github.io/open-webui-chat-fix/)
+Maintained by [@fractuscontext](https://github.com/fractuscontext).
 
----
+## Contents
 
-## What is this?
+* [Repair tools](#repair-tools)
+  * [Chat Fix](#chat-fix)
+* [Functions](#functions)
+  * [Token Saver Reloaded](#token-saver-reloaded)
+  * [Simple Prompt](#simple-prompt)
+  * [Installation](#installation)
+* [Repository layout](#repository-layout)
+* [Related issues](#related-issues)
+* [License](#license)
 
-If you use OpenWebUI, you may have encountered a bug where a specific chat refuses to open, displaying an infinite **"Loading..."** animation (or worse, hard-crashing back to the home page).
+## Repair tools
 
-![Infinite Spinning](./assets/infinite_spinning.png)
+### Chat Fix
 
-This usually happens because the chat's internal data structure ("tree") has broken links — often due to network interruptions, API errors, or third-party tools. **This tool repairs the JSON structure so you can import your chat history back into OpenWebUI.**
+[Chat Fix](./chat-fix) rescues Open WebUI chats that get stuck on the infinite "Loading..." spinner, or that crash back to the home page. It can also clean up retries, removing the regenerated responses you no longer need.
 
-Full usage instructions are built directly into the tool, just click **"Don't know how to use?"** on the page.
+🔗 [**Launch the Repair Tool**](https://fractuscontext.github.io/open-webui-tools/chat-fix/)
 
-## Features
+![Chat Fix screenshot](./chat-fix/assets/screenshot.png)
 
-### Repair 🚑
+The bug happens when a chat's internal message tree has broken links, usually after network interruptions, API errors or third-party tools. Chat Fix repairs the exported JSON so you can import the chat back into Open WebUI.
 
-- **Fixes the "Loading" Loop:** Reconnects detached messages to the main history.
-- **Restores Access:** Updates the file pointers so the chat opens immediately.
-- **Non-Destructive:** Keeps your *entire* history, including alternate generation branches.
+Usage instructions are built into the page under **"Don't know how to use?"**.
 
-### Cleaning 🧹
+* **Repair** reconnects detached messages and fixes the `currentId` pointer so the chat opens again.
+* **Non-destructive** keeps the entire history, including alternate generation branches.
+* **Prune mode** cleans up retries: it keeps only the active conversation path and drops every unused regenerated response.
+* Pure vanilla JS with no NPM, frameworks or build step. Your chat file never leaves the browser.
 
-- **Prune Mode:** Removes unused regenerated responses (alternate branches), keeping only the active conversation path.
+<details>
+<summary><b>The "Loading..." spinner</b></summary>
 
-## Technical Context
+![Infinite spinning](./chat-fix/assets/infinite_spinning.png)
 
-This tool resolves `currentId` pointers that reference non-existent nodes, prunes `childrenIds` arrays of invalid/dangling IDs, and (in Deep Clean mode) rebuilds the tree along a single linear path from root to the most recently timestamped leaf.
+</details>
 
-- **Relevant GitHub Issues:** [#15189](https://github.com/open-webui/open-webui/issues/15189), [#19225](https://github.com/open-webui/open-webui/issues/19225)
-- **Upstream Discussion:** [View Comment](https://github.com/open-webui/open-webui/issues/19225#issuecomment-3584231544)
-- **Stack:** Pure vanilla JS. No NPM, no frameworks, no build step.
+<details>
+<summary><b>Technical details</b></summary>
 
-- **Test it yourself:** Import [`tests/bad-test-1.json`](./tests/bad-test-1.json) into OpenWebUI to reproduce the crash, then run it through the tool and re-import to confirm the fix.
+* Resolves `currentId` pointers that reference non-existent nodes.
+* Prunes `childrenIds` arrays of invalid or dangling IDs.
+* Prune mode rebuilds the tree along a single linear path from the root to the most recently timestamped leaf.
+* To test it yourself, import [`bad-test-1.json`](./chat-fix/tests/bad-test-1.json) into Open WebUI to reproduce the crash, run it through the tool, then re-import the result to confirm the fix.
 
----
+</details>
 
-**License:** GPL-3.0-or-later
+## Functions
 
-Copyright © 2025-2026 [@fractuscontext](https://github.com/fractuscontext)
+Filter functions that run on every request before it reaches the model.
+
+### Token Saver Reloaded
+
+[`token-saver-reloaded.py`](./functions/token-saver-reloaded.py) cuts token usage and cost on long chats.
+
+* **History trimming** sends only the last N messages to the provider.
+* **Timestamp injection** fetches real timestamps from the Open WebUI API and adds them to past messages, so the model knows what time it is.
+* **Smart context lookup** searches the trimmed messages with semantic (`sentence-transformers`) or keyword (`rank-bm25`) matching and appends relevant hits as `<recovered_memory>`.
+* **Image pruning** strips image attachments from older messages.
+* **Token optimizer** removes filler words and corporate jargon from user messages without touching code blocks, formatting or quotes. Off by default.
+
+<details>
+<summary><b>Valves</b></summary>
+
+| Valve | Default | Description |
+| :--- | :---: | :--- |
+| `priority` | `0` | Execution order (higher runs later). |
+| `n_last_messages` | `50` | Messages to keep (user and assistant each count as 1). |
+| `supplementary_messages_to_be_sent` | `3` | Extra relevant past messages to retrieve beyond the cutoff. `0` disables lookup. |
+| `use_bm25_instead_of_sentence_transformer` | `False` | `True` uses lightweight BM25 keyword search, `False` uses PyTorch semantic search. |
+| `debug_mode` | `False` | Logs diagnostics (library status, forgotten messages, evaluation time) to the server log as WARNING. |
+| `ignore_images_after_n_messages` | `10` | Keep images only in the last N messages. |
+| `api_base_url` | `http://127.0.0.1:8080` | Open WebUI API base URL, used to fetch message timestamps. |
+| `inject_system_instructions` | `True` | Tell the model in the System Prompt how to read the injected time data. |
+| `enable_token_optimizer` | `False` | Remove common filler words from user messages. |
+| `min_words_to_optimize` | `60` | Skip optimization for shorter messages. |
+| `max_words_to_optimize` | `2000` | Skip optimization for very long messages. |
+| `optimize_current_only` | `True` | Only optimize the current (last) message. |
+
+</details>
+
+<details>
+<summary><b>Requirements</b></summary>
+
+* `httpx>=0.24.0` (usually bundled with Open WebUI)
+* `rank-bm25` for keyword search
+* `sentence-transformers` and `torch` for semantic search
+
+</details>
+
+### Simple Prompt
+
+[`simple-prompt.py`](./functions/simple-prompt.py) appends your own instructions to the System Prompt. Out of the box, it pushes the model toward short, structured answers.
+
+* **Built-in prompt** sets a soft target word count, suppresses preambles such as "As an AI" and filler phrases, and favors headers and bullet points over long prose.
+* **Custom prompt** lets you add your own instructions after the built-in one, or replace it entirely.
+* Pairs well with Token Saver Reloaded. No extra dependencies.
+
+<details>
+<summary><b>Valves</b></summary>
+
+| Valve | Default | Description |
+| :--- | :---: | :--- |
+| `priority` | `0` | Execution order (higher runs later). |
+| `target_word_count` | `240` | Soft word-count target, substituted for `{target_word_count}` in the prompts. |
+| `system_prompt` | built-in prompt | Main instructions. Edit to change them, or clear to disable. |
+| `additional_prompt` | blank | Extra instructions appended after `system_prompt`. Ignored while blank. |
+
+</details>
+
+### Installation
+
+Requires Open WebUI v0.8.4 or higher.
+
+* Go to **Admin Panel** → **Functions** → **Import From Link**.
+* Paste one of the raw URLs:
+  * [`token-saver-reloaded.py`](https://raw.githubusercontent.com/fractuscontext/open-webui-tools/main/functions/token-saver-reloaded.py)
+  * [`simple-prompt.py`](https://raw.githubusercontent.com/fractuscontext/open-webui-tools/main/functions/simple-prompt.py)
+* Enable the filter.
+
+## Repository layout
+
+* [`chat-fix/`](./chat-fix) is the static chat repair web app, served on GitHub Pages.
+* [`functions/`](./functions) holds the Open WebUI filter functions, one `.py` file per function.
+
+## Related issues
+
+* [open-webui#15189](https://github.com/open-webui/open-webui/issues/15189) and [open-webui#19225](https://github.com/open-webui/open-webui/issues/19225) cover the "Loading..." chat bug that Chat Fix repairs.
+  * [Upstream discussion](https://github.com/open-webui/open-webui/issues/19225#issuecomment-3584231544)
+
+## License
+
+[MIT](./LICENSE) © 2025-2026 [@fractuscontext](https://github.com/fractuscontext)

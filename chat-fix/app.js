@@ -113,43 +113,59 @@ function processAllChats(data, pruneMode) {
 }
 
 /**
-* Extracts plain text content from various message schema variations
+* Checks if a message contains valid content: text, attachments, tool calls, or reasoning.
+* Prevents legitimate responses from being falsely flagged as empty ghost nodes.
 */
-function extractMessageText(msg) {
-    if (!msg) return '';
-    if (typeof msg.content === 'string') return msg.content;
-    if (Array.isArray(msg.content)) {
-        return msg.content
-            .map(part => (typeof part === 'string' ? part : part?.text || ''))
-            .join('\n');
+function hasValidContent(msg) {
+    if (!msg) return false;
+
+    // File or media attachments
+    if (Array.isArray(msg.files) && msg.files.length > 0) return true;
+
+    // Tool calls or function execution payloads
+    if (Array.isArray(msg.tool_calls) && msg.tool_calls.length > 0) return true;
+    if (msg.function_call || msg.tools?.length) return true;
+
+    // Reasoning / thinking tokens (DeepSeek, o1/o3, etc.)
+    if ((typeof msg.thought === 'string' && msg.thought.trim()) ||
+        (typeof msg.reasoning_content === 'string' && msg.reasoning_content.trim())) {
+        return true;
     }
-    if (Array.isArray(msg.output)) {
-        const textParts = [];
-        for (const out of msg.output) {
-            if (out?.content && Array.isArray(out.content)) {
-                for (const c of out.content) {
-                    if (c?.text) textParts.push(c.text);
-                }
-            }
-        }
-        if (textParts.length > 0) return textParts.join('\n');
+
+    // Plain string content or text
+    if (typeof msg.content === 'string' && msg.content.trim()) return true;
+    if (typeof msg.text === 'string' && msg.text.trim()) return true;
+
+    // Array of content blocks (text, image_url, tool_use, etc.)
+    if (Array.isArray(msg.content) && msg.content.length > 0) {
+        const hasContent = msg.content.some(part => {
+            if (typeof part === 'string') return part.trim().length > 0;
+            if (part?.text) return part.text.trim().length > 0;
+            if (part?.type && part.type !== 'text') return true;
+            return false;
+        });
+        if (hasContent) return true;
     }
-    return typeof msg.text === 'string' ? msg.text : '';
+
+    // Nested output structure
+    if (Array.isArray(msg.output) && msg.output.length > 0) return true;
+
+    return false;
 }
 
 /**
-* Enforces strict User -> Assistant alternation:
-* - Consecutive User messages: Keep the LAST message
-* - Consecutive Assistant messages: Keep the FIRST message
+* Enforces role progression and strips redundant duplicate turns:
+* - Retains legitimate tool, system, assistant, and user turns without forced coercion.
+* - Consecutive messages of the same role keep the LAST message (newest retry or regenerated response).
+* - Does not drop initial assistant greetings or system prompts.
 */
 function enforceAlternatingRoles(linearMessages) {
-    // 1. Filter out completely empty ghost nodes (no text & no attachments)
+    // 1. Filter out truly empty ghost nodes (no content, attachments, or tool payloads)
     const validMessages = [];
     for (const msg of linearMessages) {
-        const text = extractMessageText(msg).trim();
-        const hasFiles = Array.isArray(msg.files) && msg.files.length > 0;
-        if (text || hasFiles) {
-            const role = (msg.role === 'assistant' || msg.role === 'model') ? 'assistant' : 'user';
+        if (hasValidContent(msg)) {
+            let role = msg.role;
+            if (role === 'model') role = 'assistant';
             validMessages.push({ ...msg, role });
         }
     }
@@ -171,21 +187,10 @@ function enforceAlternatingRoles(linearMessages) {
     }
     groups.push(currentGroup);
 
-    // 3. Apply selection rules:
-    //    - 'user' group: pick the LAST message
-    //    - 'assistant' group: pick the FIRST message
+    // 3. Keep the LAST message of consecutive groups (preserves latest retry / regeneration)
     const alternating = [];
     for (const group of groups) {
-        if (group[0].role === 'user') {
-            alternating.push(group[group.length - 1]);
-        } else {
-            alternating.push(group[0]);
-        }
-    }
-
-    // 4. Ensure the conversation starts with 'user'
-    while (alternating.length > 0 && alternating[0].role !== 'user') {
-        alternating.shift();
+        alternating.push(group[group.length - 1]);
     }
 
     return alternating;
@@ -216,6 +221,61 @@ function rebuildTreeFromLinear(linearMessages) {
 
     const currentId = linearMessages.length > 0 ? linearMessages[linearMessages.length - 1].id : null;
     return { messagesObj, currentId };
+}
+
+/**
+* Splices out redundant and ghost nodes from the active tree path without deleting alternate fork branches.
+*/
+function spliceRedundantNodesFromTree(messages, rawLinear, alternatingLinear) {
+    const retainedSet = new Set(alternatingLinear.map(m => m.id));
+    const redundantNodes = rawLinear.filter(m => !retainedSet.has(m.id));
+
+    for (const node of redundantNodes) {
+        const id = node.id;
+        const parentId = node.parentId;
+        const children = node.childrenIds || [];
+
+        // 1. Point parent to this node's children instead of this node
+        if (parentId && messages[parentId]) {
+            const parent = messages[parentId];
+            parent.childrenIds = (parent.childrenIds || []).filter(cid => cid !== id);
+            for (const cid of children) {
+                if (!parent.childrenIds.includes(cid)) {
+                    parent.childrenIds.push(cid);
+                }
+            }
+        }
+
+        // 2. Point children to this node's parent
+        for (const cid of children) {
+            if (messages[cid]) {
+                messages[cid].parentId = parentId;
+            }
+        }
+
+        // 3. Remove the redundant node from the tree
+        delete messages[id];
+    }
+
+    // Align active path pointers to alternatingLinear
+    for (let i = 0; i < alternatingLinear.length; i++) {
+        const currId = alternatingLinear[i].id;
+        const prevId = i > 0 ? alternatingLinear[i - 1].id : null;
+        const nextId = i < alternatingLinear.length - 1 ? alternatingLinear[i + 1].id : null;
+
+        if (messages[currId]) {
+            messages[currId].parentId = prevId;
+            messages[currId].role = alternatingLinear[i].role;
+            if (nextId) {
+                messages[currId].childrenIds = messages[currId].childrenIds || [];
+                if (!messages[currId].childrenIds.includes(nextId)) {
+                    messages[currId].childrenIds.push(nextId);
+                }
+            }
+        }
+    }
+
+    sanitizeGraph(messages);
 }
 
 function processSingleChat(item, pruneMode, index, globalLogs) {
@@ -249,7 +309,7 @@ function processSingleChat(item, pruneMode, index, globalLogs) {
         p = workingMessages[p].parentId;
     }
 
-    // 4. Enforce strict alternation & filter ghost nodes on active path
+    // 4. Enforce clean alternation & filter true ghost nodes on active path
     const alternatingLinear = enforceAlternatingRoles(rawLinear);
     const removedCount = rawLinear.length - alternatingLinear.length;
     if (removedCount > 0) {
@@ -259,9 +319,9 @@ function processSingleChat(item, pruneMode, index, globalLogs) {
     let finalMessagesObj;
     let finalCurrentId;
 
-    // 5. Apply branch handling based on pruneMode
+    // 5. Apply branch handling based on pruneMode (Deep Clean)
     if (pruneMode) {
-        // Flatten the tree: discard alternate branches, keep ONLY the active path
+        // Deep Clean ON: flatten tree, discard alternate branches, keep ONLY the active path
         const rebuilt = rebuildTreeFromLinear(alternatingLinear);
         finalMessagesObj = rebuilt.messagesObj;
         finalCurrentId = rebuilt.currentId;
@@ -271,13 +331,16 @@ function processSingleChat(item, pruneMode, index, globalLogs) {
             logDetails.push(`Pruned ${totalNodes - keptNodes} branch nodes`);
         }
     } else {
-        // Preserve tree: keep all alternate branches, forks, and history
+        // Deep Clean OFF: preserve alternate branches, splice out redundant/ghost turns from active thread
+        if (removedCount > 0) {
+            spliceRedundantNodesFromTree(workingMessages, rawLinear, alternatingLinear);
+        }
         finalMessagesObj = workingMessages;
-        finalCurrentId = bestId;
+        finalCurrentId = alternatingLinear.length > 0 ? alternatingLinear[alternatingLinear.length - 1].id : bestId;
     }
 
     const badges = [
-        pruneMode ? '<span class="badge">Flattened / Pruned</span>' : '<span class="badge">Branches Preserved</span>',
+        pruneMode ? '<span class="badge">Deep Clean (Flattened)</span>' : '<span class="badge">Branches Preserved</span>',
         sanitizeResult.brokenLinks > 0 ? '<span class="badge">Sanitized</span>' : ''
     ].filter(Boolean).join(' ');
 
@@ -292,11 +355,11 @@ function processSingleChat(item, pruneMode, index, globalLogs) {
         ...item,
         chat: {
             ...item.chat,
-            messages: alternatingLinear, // Linear alternating sequence for API / direct list view
+            messages: alternatingLinear,
             history: {
                 ...history,
                 currentId: finalCurrentId,
-                messages: finalMessagesObj // Full tree (pruneMode=false) or linear tree (pruneMode=true)
+                messages: finalMessagesObj
             }
         }
     };
